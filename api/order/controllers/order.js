@@ -7,28 +7,18 @@
 
 const { sanitizeEntity } = require("strapi-utils");
 const GUEST_ID = "6273d61c526f891461a89088";
+const stripe = require("stripe")(process.env.STRIPE_SK);
 
 module.exports = {
-  async place(ctx) {
+  async process(ctx) {
     const {
-      shippingAddress,
-      billingAddress,
-      shippingInfo,
-      billingInfo,
-      shippingOption,
-      subtotal,
-      tax,
-      total,
       items,
+      total,
+      shippingOption,
+      idempotencyKey,
+      storedIntent,
+      email,
     } = ctx.request.body;
-
-    let orderCustomer;
-
-    if (ctx.state.user) {
-      orderCustomer = ctx.state.user.id;
-    } else {
-      orderCustomer = GUEST_ID;
-    }
 
     let serverTotal = 0;
     let unavailable = [];
@@ -41,11 +31,6 @@ module.exports = {
 
         if (serverItem.qty < clientItem.qty) {
           unavailable.push({ id: serverItem.id, qty: serverItem.qty });
-        } else {
-          await strapi.services.variant.update(
-            { id: clientItem.variant.id },
-            { qty: serverItem.qty - clientItem.qty }
-          );
         }
 
         serverTotal += serverItem.price * clientItem.qty;
@@ -73,26 +58,86 @@ module.exports = {
     } else if (unavailable.length > 0) {
       ctx.send({ unavailable }, 409);
     } else {
-      let order = await strapi.services.order.create({
-        shippingAddress,
-        billingAddress,
-        shippingInfo,
-        billingInfo,
-        shippingOption,
-        subtotal,
-        tax,
-        total,
-        items,
-        user: orderCustomer,
-      });
+      if (storedIntent) {
+        const update = await stripe.paymentIntents.update(
+          storedIntent,
+          {
+            //stripe uses cents so we need to multiplicate by 100
+            amount: total * 100,
+          },
+          { idempotencyKey }
+        );
 
-      order = sanitizeEntity(order, { model: strapi.models.order });
+        ctx.send({ client_secret: update.client_secret, intentID: update.id });
+      } else {
+        const intent = await stripe.paymentIntents.create(
+          {
+            amount: total * 100,
+            currency: "usd",
+            customer: ctx.state.user ? ctx.state.user.stripeID : undefined,
+            receipt_email: email,
+          },
+          { idempotencyKey }
+        );
 
-      if (order.user.username === "Guest") {
-        order.user = { username: "Guest" };
+        ctx.send({ client_secret: intent.client_secret, intentID: intent.id });
       }
-
-      ctx.send({ order }, 200);
     }
+  },
+
+  async finalize(ctx) {
+    const {
+      shippingAddress,
+      billingAddress,
+      shippingInfo,
+      billingInfo,
+      shippingOption,
+      subtotal,
+      tax,
+      total,
+      items,
+      transaction,
+    } = ctx.request.body;
+
+    let orderCustomer;
+
+    if (ctx.state.user) {
+      orderCustomer = ctx.state.user.id;
+    } else {
+      orderCustomer = GUEST_ID;
+    }
+
+    await Promise.all(
+      items.map(async (clientItem) => {
+        const serverItem = await strapi.services.variant.findOne({
+          id: clientItem.variant.id,
+        });
+        await strapi.services.variant.update(
+          { id: clientItem.variant.id },
+          { qty: serverItem.qty - clientItem.qty }
+        );
+      })
+    );
+    let order = await strapi.services.order.create({
+      shippingAddress,
+      billingAddress,
+      shippingInfo,
+      billingInfo,
+      shippingOption,
+      subtotal,
+      tax,
+      total,
+      items,
+      transaction,
+      user: orderCustomer,
+    });
+
+    order = sanitizeEntity(order, { model: strapi.models.order });
+
+    if (order.user.username === "Guest") {
+      order.user = { username: "Guest" };
+    }
+
+    ctx.send({ order }, 200);
   },
 };

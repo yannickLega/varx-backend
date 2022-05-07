@@ -10,8 +10,16 @@
     },
     {
       "method": "POST",
-      "path": "/orders/place",
-      "handler": "order.place",
+      "path": "/orders/process",
+      "handler": "order.process",
+      "config": {
+        "policies": []
+      }
+    },
+    {
+      "method": "POST",
+      "path": "/orders/finalize",
+      "handler": "order.finalize",
       "config": {
         "policies": []
       }
